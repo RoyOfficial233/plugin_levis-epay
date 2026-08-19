@@ -1,0 +1,17 @@
+# 易支付插件配置示例
+# 商户 ID（必填）
+pid: 1297
+# 商户密钥（必填，敏感信息）
+key: CltLwX0FovOapOg0ZvlKlW0OX0OGPawT
+# 易支付网关地址
+gateway_url: https://dash.natriumgroup.com/
+# 默认支付方式（必填，仅支持支付宝或微信）
+# 可选值：alipay、wxpay
+payment_type: alipay
+
+# 权限授予（在 Levis 管理后台勾选）
+# wallet:credit：支付到账时给用户充值
+# order:read：读取订单并校验金额
+
+# 异步通知地址由主程序提供：
+# https://your-domain.com/api/plugin/v1/payment-notify/epay

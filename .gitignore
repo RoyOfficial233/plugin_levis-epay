@@ -1,0 +1,29 @@
+# 二进制文件
+plugin
+plugin.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 测试相关
+*.test
+*.out
+coverage.txt
+
+# 依赖
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>易支付配置</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="header">
+      <div>
+        <p class="eyebrow">LEVIS PAYMENT PLUGIN</p>
+        <h1>易支付</h1>
+        <p class="muted">配置商户信息后，用户可通过易支付完成充值、订单和续费。</p>
+      </div>
+      <span id="state" class="state">读取中</span>
+    </header>
+
+    <form id="config-form" class="panel" novalidate>
+      <div class="field">
+        <label for="pid">商户 ID</label>
+        <input id="pid" name="pid" autocomplete="off" required>
+        <p>填写易支付平台分配的商户 ID。</p>
+      </div>
+      <div class="field">
+        <label for="key">商户密钥</label>
+        <input id="key" name="key" type="password" autocomplete="new-password" placeholder="留空则保留当前密钥">
+        <p id="key-hint">密钥只会写入 Levis，不会回显到页面。</p>
+      </div>
+      <div class="field">
+        <label for="gateway_url">网关地址</label>
+        <input id="gateway_url" name="gateway_url" type="url" autocomplete="url" required>
+        <p>例如 https://example.com，不要填写 /mapi.php。</p>
+      </div>
+      <div class="field">
+        <label for="payment_type">默认支付方式</label>
+        <select id="payment_type" name="payment_type">
+          <option value="alipay">支付宝</option>
+          <option value="wxpay">微信支付</option>
+        </select>
+      </div>
+      <div id="message" class="message" role="status" aria-live="polite"></div>
+      <div class="actions">
+        <button id="save" type="submit">保存配置</button>
+      </div>
+    </form>
+  </main>
+  <script src="./app.js" defer></script>
+</body>
+</html>
