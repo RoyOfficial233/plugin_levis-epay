@@ -212,6 +212,7 @@ func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentReq
 		"money":        formatMoney(req.GetAmountCents()),
 		"param":        req.GetExternalId(), // 回传订单 ID
 		"sign_type":    "MD5",
+		"clientip":     req.GetClientIp(),
 	}
 
 	// payment_type 已在 Configure 中限制为 alipay/wxpay。
