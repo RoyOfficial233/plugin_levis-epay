@@ -39,7 +39,7 @@ import (
 
 const (
 	pluginName    = "易支付"
-	pluginVersion = "2.0.0"
+	pluginVersion = "2.0.1"
 	pluginDesc    = "对接易支付 V1，仅支持支付宝和微信支付（支持多支付方式复用）"
 )
 
@@ -230,40 +230,45 @@ func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentReq
 	if notifyURL == "" {
 		notifyURL = p.notifyURL
 	}
-	// 构造易支付 API 请求
+	// 构造易支付 API 请求，与 epay-sdk-go 保持一致使用 GET /mapi.php
 	params := map[string]string{
 		"pid":          pid,
 		"out_trade_no": req.GetExternalId(),
 		"notify_url":   notifyURL,
 		"name":         req.GetSubject(),
 		"money":        formatMoney(req.GetAmountCents()),
-		"param":        req.GetExternalId(), // 回传订单 ID
 		"sign_type":    "MD5",
 	}
-	clientIP := req.GetClientIp()
-	if clientIP == "" {
-		clientIP = "127.0.0.1"
+	// 可选参数：仅当提供时才加入，与 SDK 保持一致避免多余签名因子
+	if req.GetExternalId() != "" {
+		params["param"] = req.GetExternalId()
 	}
-	params["clientip"] = clientIP
-
-	params["type"] = paymentType
+	if cid := strings.TrimSpace(req.GetClientIp()); cid != "" {
+		params["clientip"] = cid
+	}
+	if paymentType != "" {
+		params["type"] = paymentType
+	}
+	// mapi 接口默认使用 pc 设备，SDK 中为可选，此处保留以兼容部分网关
 	params["device"] = "pc"
-	return p.createAPIPaymentWithKey(ctx, params, req, key, gatewayURL)
+	return p.createAPIPaymentWithKey(ctx, params, key, gatewayURL)
 }
 
 // createAPIPayment 调用 mapi.php 接口创建支付订单（兼容旧调用方，使用全局配置）
 func (p *epayPlugin) createAPIPayment(ctx context.Context, params map[string]string, req *pb.CreatePaymentRequest) (*pb.CreatePaymentReply, error) {
-	return p.createAPIPaymentWithKey(ctx, params, req, p.key, p.gatewayURL)
+	return p.createAPIPaymentWithKey(ctx, params, p.key, p.gatewayURL)
 }
 
-func (p *epayPlugin) createAPIPaymentWithKey(ctx context.Context, params map[string]string, req *pb.CreatePaymentRequest, key, gatewayURL string) (*pb.CreatePaymentReply, error) {
-	// 签名
+func (p *epayPlugin) createAPIPaymentWithKey(ctx context.Context, params map[string]string, key, gatewayURL string) (*pb.CreatePaymentReply, error) {
+	// 签名（过滤空值与 sign/sign_type 后按 ASCII 排序拼接 + key 再 MD5）
 	params["sign"] = signMD5(params, key)
+	params["sign_type"] = "MD5"
 
-	// 发起 HTTP POST 请求
-	apiURL := gatewayURL + "/mapi.php"
-	resp, err := postForm(ctx, apiURL, params)
-	if err != nil {
+	base := strings.TrimRight(gatewayURL, "/")
+	apiURL := base + "/mapi.php?" + buildQuery(params)
+
+	var resp epayAPIResponse
+	if err := httpGet(ctx, apiURL, &resp); err != nil {
 		return nil, status.Errorf(codes.Internal, "调用易支付 API 失败: %v", err)
 	}
 
@@ -271,9 +276,19 @@ func (p *epayPlugin) createAPIPaymentWithKey(ctx context.Context, params map[str
 		return nil, status.Errorf(codes.Internal, "易支付返回错误: %s", resp.Msg)
 	}
 
-	// 返回支付跳转 URL 或二维码
+	payURL := resp.PayURL
+	if payURL == "" {
+		payURL = resp.QRCode
+	}
+	if payURL == "" {
+		payURL = resp.URLScheme
+	}
+	if payURL == "" {
+		return nil, status.Errorf(codes.Internal, "易支付未返回支付地址")
+	}
+
 	return &pb.CreatePaymentReply{
-		PayUrl:     resp.PayURL,
+		PayUrl:     payURL,
 		GatewayRef: resp.TradeNo,
 	}, nil
 }
@@ -301,9 +316,19 @@ func (p *epayPlugin) QueryPayment(ctx context.Context, req *pb.QueryPaymentReque
 		return nil, status.Error(codes.FailedPrecondition, "未配置易支付网关地址")
 	}
 
-	// 调用易支付查询订单接口，out_trade_no 是商户单号
-	apiURL := fmt.Sprintf("%s/api.php?act=order&pid=%s&key=%s&out_trade_no=%s",
-		gatewayURL, pid, key, req.GetExternalId())
+	// 调用易支付查询订单接口，与 epay-sdk-go 保持一致：仅传 pid/act/out_trade_no 并签名，不直接传 key
+	params := map[string]string{
+		"pid":          pid,
+		"act":          "order",
+		"out_trade_no": req.GetExternalId(),
+	}
+	// 兼容部分网关同时支持 trade_no 查询
+	if req.GetGatewayRef() != "" {
+		// 优先 out_trade_no，若外部已提供 trade_no 也可在签名外附加（不影响签名校验）
+	}
+	params["sign"] = signMD5(params, key)
+	params["sign_type"] = "MD5"
+	apiURL := strings.TrimRight(gatewayURL, "/") + "/api.php?" + buildQuery(params)
 
 	var result struct {
 		Code    int    `json:"code"`
