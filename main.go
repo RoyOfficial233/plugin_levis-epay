@@ -29,6 +29,8 @@ import (
 	"strings"
 	"time"
 
+	epay "github.com/liuscraft/epay-sdk-go"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -40,8 +42,8 @@ import (
 
 const (
 	pluginName    = "易支付"
-	pluginVersion = "2.0.3"
-	pluginDesc    = "对接易支付 V1，仅支持支付宝和微信支付（支持多支付方式复用）"
+	pluginVersion = "2.0.4"
+	pluginDesc    = "对接易支付 V1，全量采用 MD5 验证（对接官方 SDK）"
 )
 
 func main() {
@@ -217,174 +219,81 @@ func (p *epayPlugin) Shutdown(context.Context, *pb.ShutdownRequest) (*pb.Shutdow
 }
 
 func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentRequest) (*pb.CreatePaymentReply, error) {
-	pid, key, gatewayURL, paymentType := epayConfig(req.GetConfig(), p.pid, p.key, p.gatewayURL, p.paymentType)
-	if pid == "" || key == "" {
+	pidStr, key, gatewayURL, paymentType := epayConfig(req.GetConfig(), p.pid, p.key, p.gatewayURL, p.paymentType)
+	if pidStr == "" || key == "" {
 		return nil, status.Error(codes.FailedPrecondition, "支付方式未配置 PID/KEY")
-	}
-	if paymentType != "alipay" && paymentType != "wxpay" {
-		return nil, status.Error(codes.InvalidArgument, "支付方式仅支持支付宝或微信支付")
 	}
 	if gatewayURL == "" {
 		return nil, status.Error(codes.FailedPrecondition, "未配置易支付网关地址")
+	}
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "商户 ID 必须为数字")
 	}
 	notifyURL := req.GetNotifyUrl()
 	if notifyURL == "" {
 		notifyURL = p.notifyURL
 	}
-	// 构造易支付 API 请求，与 epay-sdk-go 保持一致使用 GET /mapi.php
-	params := map[string]string{
-		"pid":          pid,
-		"out_trade_no": req.GetExternalId(),
-		"notify_url":   notifyURL,
-		"name":         req.GetSubject(),
-		"money":        formatMoney(req.GetAmountCents()),
-		"sign_type":    "MD5",
-	}
-	// 可选参数：仅当提供时才加入，与 SDK 保持一致避免多余签名因子
-	if req.GetExternalId() != "" {
-		params["param"] = req.GetExternalId()
-	}
-	if cid := strings.TrimSpace(req.GetClientIp()); cid != "" {
-		params["clientip"] = cid
-	}
-	if paymentType != "" {
-		params["type"] = paymentType
-	}
-	// mapi 接口默认使用 pc 设备，SDK 中为可选，此处保留以兼容部分网关
-	params["device"] = "pc"
-	return p.createAPIPaymentWithKey(ctx, params, key, gatewayURL)
-}
-
-// createAPIPayment 调用 mapi.php 接口创建支付订单（兼容旧调用方，使用全局配置）
-func (p *epayPlugin) createAPIPayment(ctx context.Context, params map[string]string, req *pb.CreatePaymentRequest) (*pb.CreatePaymentReply, error) {
-	return p.createAPIPaymentWithKey(ctx, params, p.key, p.gatewayURL)
-}
-
-func (p *epayPlugin) createAPIPaymentWithKey(ctx context.Context, params map[string]string, key, gatewayURL string) (*pb.CreatePaymentReply, error) {
-	// 签名（过滤空值与 sign/sign_type 后按 ASCII 排序拼接 + key 再 MD5）
-	params["sign"] = signMD5(params, key)
-	params["sign_type"] = "MD5"
-
-	base := strings.TrimRight(gatewayURL, "/")
-	// 优先使用 POST，与部分仅支持 POST 的网关保持兼容
-	apiURL := base + "/mapi.php"
-	resp, err := postForm(ctx, apiURL, params)
-	if err == nil && int(resp.Code) == 1 {
-		payURL := resp.PayURL
-		if payURL == "" {
-			payURL = resp.QRCode
-		}
-		if payURL == "" {
-			payURL = resp.URLScheme
-		}
-		if payURL != "" {
-			return &pb.CreatePaymentReply{PayUrl: payURL, GatewayRef: resp.TradeNo}, nil
-		}
-	}
-	// POST 失败或返回非成功时，判断是否为“未传入任何参数”类提示，若是则回退到 GET
-	shouldFallback := false
+	// 全部采用 V1 MD5 接口，通过官方 SDK 保证签名与参数一致
+	client, err := epay.NewClient(&epay.Config{PID: pid, Key: key, APIBaseURL: gatewayURL})
 	if err != nil {
-		shouldFallback = true
-	} else if resp != nil && strings.Contains(resp.Msg, "未传入") {
-		shouldFallback = true
+		return nil, status.Errorf(codes.InvalidArgument, "易支付配置错误: %v", err)
 	}
-	if shouldFallback {
-		getURL := base + "/mapi.php?" + buildQuery(params)
-		var getResp epayAPIResponse
-		if err2 := httpGet(ctx, getURL, &getResp); err2 == nil && int(getResp.Code) == 1 {
-			payURL := getResp.PayURL
-			if payURL == "" {
-				payURL = getResp.QRCode
-			}
-			if payURL == "" {
-				payURL = getResp.URLScheme
-			}
-			if payURL != "" {
-				return &pb.CreatePaymentReply{PayUrl: payURL, GatewayRef: getResp.TradeNo}, nil
-			}
-		} else if err2 == nil {
-			// GET 明确返回业务错误，优先返回 GET 的错误信息
-			return nil, status.Errorf(codes.Internal, "易支付返回错误: %s", getResp.Msg)
-		}
-	}
-	// 若未回退或回退未成功，返回原始 POST 错误
+	resp, err := client.CreatePayment(&epay.PaymentRequest{
+		Type:       paymentType,
+		OutTradeNo: req.GetExternalId(),
+		NotifyURL:  notifyURL,
+		Name:       req.GetSubject(),
+		Money:      float64(req.GetAmountCents()) / 100,
+		ClientIP:   strings.TrimSpace(req.GetClientIp()),
+		Device:     "pc",
+		Param:      req.GetExternalId(),
+	})
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "调用易支付 API 失败: %v", err)
+		return nil, status.Errorf(codes.Internal, "易支付返回错误: %v", err)
 	}
-	if int(resp.Code) != 1 {
-		return nil, status.Errorf(codes.Internal, "易支付返回错误: %s", resp.Msg)
+	payURL := resp.PayURL
+	if payURL == "" {
+		payURL = resp.QRCode
 	}
-	// 理论上已在前面返回，此处兜底
-	return nil, status.Errorf(codes.Internal, "易支付未返回支付地址")
-}
-
-// createSubmitPayment is retained for compatibility with older callers; current configuration always uses mapi.php.
-func (p *epayPlugin) createSubmitPayment(params map[string]string, req *pb.CreatePaymentRequest) (*pb.CreatePaymentReply, error) {
-	params["return_url"] = p.notifyURL // 同步回调地址
-	params["sign"] = signMD5(params, p.key)
-
-	// 拼接成 URL
-	submitURL := p.gatewayURL + "/submit.php?" + buildQuery(params)
-
-	return &pb.CreatePaymentReply{
-		PayUrl:     submitURL,
-		GatewayRef: req.GetExternalId(), // 尚未获取到平台订单号，先用商户订单号
-	}, nil
+	if payURL == "" {
+		payURL = resp.URLScheme
+	}
+	if payURL == "" {
+		return nil, status.Errorf(codes.Internal, "易支付未返回支付地址")
+	}
+	return &pb.CreatePaymentReply{PayUrl: payURL, GatewayRef: resp.TradeNo}, nil
 }
 
 func (p *epayPlugin) QueryPayment(ctx context.Context, req *pb.QueryPaymentRequest) (*pb.QueryPaymentReply, error) {
-	pid, key, gatewayURL, _ := epayConfig(req.GetConfig(), p.pid, p.key, p.gatewayURL, p.paymentType)
-	if pid == "" || key == "" {
+	pidStr, key, gatewayURL, _ := epayConfig(req.GetConfig(), p.pid, p.key, p.gatewayURL, p.paymentType)
+	if pidStr == "" || key == "" {
 		return nil, status.Error(codes.FailedPrecondition, "支付方式未配置 PID/KEY")
 	}
 	if gatewayURL == "" {
 		return nil, status.Error(codes.FailedPrecondition, "未配置易支付网关地址")
 	}
-
-	// 调用易支付查询订单接口，与 epay-sdk-go 保持一致：仅传 pid/act/out_trade_no 并签名，不直接传 key
-	params := map[string]string{
-		"pid":          pid,
-		"act":          "order",
-		"out_trade_no": req.GetExternalId(),
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "商户 ID 必须为数字")
 	}
-	// 兼容部分网关同时支持 trade_no 查询
-	if req.GetGatewayRef() != "" {
-		// 优先 out_trade_no，若外部已提供 trade_no 也可在签名外附加（不影响签名校验）
+	client, err := epay.NewClient(&epay.Config{PID: pid, Key: key, APIBaseURL: gatewayURL})
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "易支付配置错误: %v", err)
 	}
-	params["sign"] = signMD5(params, key)
-	params["sign_type"] = "MD5"
-	apiURL := strings.TrimRight(gatewayURL, "/") + "/api.php?" + buildQuery(params)
-
-	var result struct {
-		Code    flexInt `json:"code"`
-		Msg     string  `json:"msg"`
-		Status  flexInt `json:"status"`
-		Money   string  `json:"money"`
-		TradeNo string  `json:"trade_no"`
-	}
-
-	if err := httpGet(ctx, apiURL, &result); err != nil {
+	detail, err := client.QueryOrder(&epay.OrderQueryRequest{OutTradeNo: req.GetExternalId()})
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "查询订单失败: %v", err)
 	}
-
-	if int(result.Code) != 1 {
-		return nil, status.Errorf(codes.NotFound, "订单不存在: %s", result.Msg)
-	}
-
 	state := pb.PaymentState_PAYMENT_STATE_PENDING
-	if int(result.Status) == 1 {
+	if detail.Status == epay.OrderStatusPaid {
 		state = pb.PaymentState_PAYMENT_STATE_PAID
 	}
-
-	paidCents := parseMoneyToCents(result.Money)
-
-	return &pb.QueryPaymentReply{
-		State:           state,
-		PaidAmountCents: paidCents,
-	}, nil
+	paidCents := parseMoneyToCents(detail.Money)
+	return &pb.QueryPaymentReply{State: state, PaidAmountCents: paidCents}, nil
 }
 
-// VerifyPaymentCallback 验证易支付异步通知的签名并归一化返回结果。
+// VerifyPaymentCallback 验证易支付异步通知的签名并归一化返回结果，全部采用 V1 MD5。
 func (p *epayPlugin) VerifyPaymentCallback(_ context.Context, req *pb.VerifyPaymentCallbackRequest) (*pb.VerifyPaymentCallbackReply, error) {
 	raw := req.GetRaw()
 	if raw == nil {
@@ -398,46 +307,68 @@ func (p *epayPlugin) VerifyPaymentCallback(_ context.Context, req *pb.VerifyPaym
 		return nil, status.Error(codes.InvalidArgument, "不支持的签名类型")
 	}
 
-	// 用本地密钥重新计算签名（优先按支付方式配置的 KEY）
-	_, key, _, _ := epayConfig(req.GetConfig(), p.pid, p.key, p.gatewayURL, p.paymentType)
+	// 采用官方 SDK 的 V1 MD5 校验，与 epay-sdk-go 保持一致
+	pidStr, key, gatewayURL, _ := epayConfig(req.GetConfig(), p.pid, p.key, p.gatewayURL, p.paymentType)
 	if key == "" {
 		return nil, status.Error(codes.FailedPrecondition, "支付方式未配置 KEY")
 	}
-	expectedSign := signCallback(raw, key)
-	if receivedSign != expectedSign {
-		return nil, status.Error(codes.Unauthenticated, "签名验证失败")
+	// 校验签名类型
+	if signType != "" && signType != "MD5" {
+		return nil, status.Error(codes.InvalidArgument, "不支持的签名类型")
 	}
-
-	externalID := raw["out_trade_no"]
-	if externalID == "" {
+	pid := 0
+	if pidStr != "" {
+		pid, _ = strconv.Atoi(pidStr)
+	} else if raw["pid"] != "" {
+		pid, _ = strconv.Atoi(raw["pid"])
+	}
+	if pid == 0 {
+		pid = 1
+	}
+	if gatewayURL == "" {
+		gatewayURL = "https://example.com"
+	}
+	client, err := epay.NewClient(&epay.Config{PID: pid, Key: key, APIBaseURL: gatewayURL})
+	var notifyData *epay.NotifyData
+	if err == nil {
+		notifyData, err = client.VerifyNotify(raw)
+		if err != nil {
+			return nil, status.Error(codes.Unauthenticated, "签名验证失败")
+		}
+	} else {
+		// 兜底：SDK 创建失败时使用本地 MD5 校验
+		expectedSign := signCallback(raw, key)
+		if receivedSign != expectedSign {
+			return nil, status.Error(codes.Unauthenticated, "签名验证失败")
+		}
+		notifyData = &epay.NotifyData{
+			OutTradeNo:  raw["out_trade_no"],
+			TradeNo:     raw["trade_no"],
+			TradeStatus: raw["trade_status"],
+			Money:       raw["money"],
+		}
+	}
+	if notifyData.OutTradeNo == "" {
 		return nil, status.Error(codes.InvalidArgument, "缺少商户单号")
 	}
-
-	tradeStatus := raw["trade_status"]
-	gatewayRef := raw["trade_no"]
-	money := raw["money"]
-
 	state := pb.PaymentState_PAYMENT_STATE_PENDING
-	switch tradeStatus {
-	case "TRADE_SUCCESS":
+	switch notifyData.TradeStatus {
+	case epay.TradeStatusSuccess:
 		state = pb.PaymentState_PAYMENT_STATE_PAID
 	default:
-		// 非成功状态暂不处理，主程序会保持 pending
 	}
-
-	paidCents := parseMoneyToCents(money)
-
+	paidCents := parseMoneyToCents(notifyData.Money)
 	return &pb.VerifyPaymentCallbackReply{
-		ExternalId:      externalID,
-		GatewayRef:      gatewayRef,
+		ExternalId:      notifyData.OutTradeNo,
+		GatewayRef:      notifyData.TradeNo,
 		State:           state,
 		PaidAmountCents: paidCents,
 		Currency:        "CNY",
-		Message:         tradeStatus,
+		Message:         notifyData.TradeStatus,
 	}, nil
 }
 
-// signCallback 计算易支付回调参数的 MD5 签名。
+// signCallback 计算易支付回调参数的 MD5 签名（保留供 SDK 创建失败时兜底）。
 func signCallback(params map[string]string, key string) string {
 	var keys []string
 	for k := range params {
@@ -453,7 +384,7 @@ func signCallback(params map[string]string, key string) string {
 	}
 	str := strings.Join(pairs, "&") + key
 	h := md5.Sum([]byte(str))
-	return hex.EncodeToString(h[:])
+	return strings.ToLower(fmt.Sprintf("%x", h))
 }
 
 // parseMoneyToCents 将元字符串（如 "1.00"）转为分。

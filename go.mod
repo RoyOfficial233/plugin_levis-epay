@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/SakuraOpenSource/levis v0.0.0
+	github.com/liuscraft/epay-sdk-go v0.0.0
 	google.golang.org/grpc v1.83.0
 )
 
@@ -15,5 +16,7 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-// 本地依赖主项目
+// 本地依赖
 replace github.com/SakuraOpenSource/levis => ../levis
+
+replace github.com/liuscraft/epay-sdk-go => ../epay-sdk-go
