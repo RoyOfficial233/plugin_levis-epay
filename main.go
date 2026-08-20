@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,7 +40,7 @@ import (
 
 const (
 	pluginName    = "易支付"
-	pluginVersion = "2.0.1"
+	pluginVersion = "2.0.3"
 	pluginDesc    = "对接易支付 V1，仅支持支付宝和微信支付（支持多支付方式复用）"
 )
 
@@ -265,32 +266,56 @@ func (p *epayPlugin) createAPIPaymentWithKey(ctx context.Context, params map[str
 	params["sign_type"] = "MD5"
 
 	base := strings.TrimRight(gatewayURL, "/")
-	apiURL := base + "/mapi.php?" + buildQuery(params)
-
-	var resp epayAPIResponse
-	if err := httpGet(ctx, apiURL, &resp); err != nil {
+	// 优先使用 POST，与部分仅支持 POST 的网关保持兼容
+	apiURL := base + "/mapi.php"
+	resp, err := postForm(ctx, apiURL, params)
+	if err == nil && int(resp.Code) == 1 {
+		payURL := resp.PayURL
+		if payURL == "" {
+			payURL = resp.QRCode
+		}
+		if payURL == "" {
+			payURL = resp.URLScheme
+		}
+		if payURL != "" {
+			return &pb.CreatePaymentReply{PayUrl: payURL, GatewayRef: resp.TradeNo}, nil
+		}
+	}
+	// POST 失败或返回非成功时，判断是否为“未传入任何参数”类提示，若是则回退到 GET
+	shouldFallback := false
+	if err != nil {
+		shouldFallback = true
+	} else if resp != nil && strings.Contains(resp.Msg, "未传入") {
+		shouldFallback = true
+	}
+	if shouldFallback {
+		getURL := base + "/mapi.php?" + buildQuery(params)
+		var getResp epayAPIResponse
+		if err2 := httpGet(ctx, getURL, &getResp); err2 == nil && int(getResp.Code) == 1 {
+			payURL := getResp.PayURL
+			if payURL == "" {
+				payURL = getResp.QRCode
+			}
+			if payURL == "" {
+				payURL = getResp.URLScheme
+			}
+			if payURL != "" {
+				return &pb.CreatePaymentReply{PayUrl: payURL, GatewayRef: getResp.TradeNo}, nil
+			}
+		} else if err2 == nil {
+			// GET 明确返回业务错误，优先返回 GET 的错误信息
+			return nil, status.Errorf(codes.Internal, "易支付返回错误: %s", getResp.Msg)
+		}
+	}
+	// 若未回退或回退未成功，返回原始 POST 错误
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "调用易支付 API 失败: %v", err)
 	}
-
-	if resp.Code != 1 {
+	if int(resp.Code) != 1 {
 		return nil, status.Errorf(codes.Internal, "易支付返回错误: %s", resp.Msg)
 	}
-
-	payURL := resp.PayURL
-	if payURL == "" {
-		payURL = resp.QRCode
-	}
-	if payURL == "" {
-		payURL = resp.URLScheme
-	}
-	if payURL == "" {
-		return nil, status.Errorf(codes.Internal, "易支付未返回支付地址")
-	}
-
-	return &pb.CreatePaymentReply{
-		PayUrl:     payURL,
-		GatewayRef: resp.TradeNo,
-	}, nil
+	// 理论上已在前面返回，此处兜底
+	return nil, status.Errorf(codes.Internal, "易支付未返回支付地址")
 }
 
 // createSubmitPayment is retained for compatibility with older callers; current configuration always uses mapi.php.
@@ -331,23 +356,23 @@ func (p *epayPlugin) QueryPayment(ctx context.Context, req *pb.QueryPaymentReque
 	apiURL := strings.TrimRight(gatewayURL, "/") + "/api.php?" + buildQuery(params)
 
 	var result struct {
-		Code    int    `json:"code"`
-		Msg     string `json:"msg"`
-		Status  int    `json:"status"`
-		Money   string `json:"money"`
-		TradeNo string `json:"trade_no"`
+		Code    flexInt `json:"code"`
+		Msg     string  `json:"msg"`
+		Status  flexInt `json:"status"`
+		Money   string  `json:"money"`
+		TradeNo string  `json:"trade_no"`
 	}
 
 	if err := httpGet(ctx, apiURL, &result); err != nil {
 		return nil, status.Errorf(codes.Internal, "查询订单失败: %v", err)
 	}
 
-	if result.Code != 1 {
+	if int(result.Code) != 1 {
 		return nil, status.Errorf(codes.NotFound, "订单不存在: %s", result.Msg)
 	}
 
 	state := pb.PaymentState_PAYMENT_STATE_PENDING
-	if result.Status == 1 {
+	if int(result.Status) == 1 {
 		state = pb.PaymentState_PAYMENT_STATE_PAID
 	}
 
@@ -493,13 +518,30 @@ func postForm(ctx context.Context, apiURL string, params map[string]string) (*ep
 	return &result, nil
 }
 
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(data []byte) error {
+	s := strings.Trim(string(data), `"`)
+	if s == "" || s == "null" {
+		*f = 0
+		return nil
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		*f = 0
+		return nil
+	}
+	*f = flexInt(v)
+	return nil
+}
+
 type epayAPIResponse struct {
-	Code      int    `json:"code"`
-	Msg       string `json:"msg"`
-	TradeNo   string `json:"trade_no"`
-	PayURL    string `json:"payurl"`
-	QRCode    string `json:"qrcode"`
-	URLScheme string `json:"urlscheme"`
+	Code      flexInt `json:"code"`
+	Msg       string  `json:"msg"`
+	TradeNo   string  `json:"trade_no"`
+	PayURL    string  `json:"payurl"`
+	QRCode    string  `json:"qrcode"`
+	URLScheme string  `json:"urlscheme"`
 }
 
 // buildQuery 构造 URL 查询字符串（已转义）
