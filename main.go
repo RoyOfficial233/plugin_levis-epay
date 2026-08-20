@@ -42,8 +42,8 @@ import (
 
 const (
 	pluginName    = "易支付"
-	pluginVersion = "2.0.4"
-	pluginDesc    = "对接易支付 V1，全量采用 MD5 验证（对接官方 SDK）"
+	pluginVersion = "2.0.5"
+	pluginDesc    = "对接易支付 V1，全量采用 MD5 验证（SDK + POST 回退）"
 )
 
 func main() {
@@ -250,6 +250,39 @@ func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentReq
 		Param:      req.GetExternalId(),
 	})
 	if err != nil {
+		// 兼容仅支持 POST 的网关：SDK 走 GET /mapi.php，若网关返回“未传入任何参数”则回退到 POST
+		if strings.Contains(err.Error(), "未传入") {
+			params := map[string]string{
+				"pid":          pidStr,
+				"out_trade_no": req.GetExternalId(),
+				"notify_url":   notifyURL,
+				"name":         req.GetSubject(),
+				"money":        formatMoney(req.GetAmountCents()),
+				"type":         paymentType,
+				"device":       "pc",
+				"param":        req.GetExternalId(),
+			}
+			if cid := strings.TrimSpace(req.GetClientIp()); cid != "" {
+				params["clientip"] = cid
+			}
+			params["sign"] = signMD5(params, key)
+			params["sign_type"] = "MD5"
+			base := strings.TrimRight(gatewayURL, "/")
+			if postResp, perr := postForm(ctx, base+"/mapi.php", params); perr == nil && int(postResp.Code) == 1 {
+				payURL := postResp.PayURL
+				if payURL == "" {
+					payURL = postResp.QRCode
+				}
+				if payURL == "" {
+					payURL = postResp.URLScheme
+				}
+				if payURL != "" {
+					return &pb.CreatePaymentReply{PayUrl: payURL, GatewayRef: postResp.TradeNo}, nil
+				}
+			} else if perr == nil {
+				return nil, status.Errorf(codes.Internal, "易支付返回错误: %s", postResp.Msg)
+			}
+		}
 		return nil, status.Errorf(codes.Internal, "易支付返回错误: %v", err)
 	}
 	payURL := resp.PayURL
