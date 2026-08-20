@@ -42,8 +42,8 @@ import (
 
 const (
 	pluginName    = "易支付"
-	pluginVersion = "2.0.6"
-	pluginDesc    = "对接易支付 V1，全量采用 MD5 验证（SDK + POST 回退，支持调试日志）"
+	pluginVersion = "2.0.7"
+	pluginDesc    = "对接易支付 V1，全量采用 MD5 验证（SDK + POST 回退，支持调试与自定义通知地址）"
 )
 
 func main() {
@@ -170,6 +170,14 @@ func (p *epayPlugin) Describe(context.Context, *pb.DescribeRequest) (*pb.Manifes
 					{Value: "wxpay", Label: "微信支付"},
 				},
 			},
+			{
+				Key:          "notify_url",
+				Label:        "异步通知地址",
+				Type:         pb.FieldType_FIELD_TYPE_TEXT,
+				Required:     false,
+				DefaultValue: "",
+				Hint:         "可选，留空则自动使用 Levis 回调地址；自定义示例：https://yourdomain.com/api/plugin/v1/payment-notify/epay/3",
+			},
 		},
 		RequiredScopes: []string{"wallet:credit", "order:read"},
 	}, nil
@@ -258,7 +266,12 @@ func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentReq
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "商户 ID 必须为数字")
 	}
-	notifyURL := req.GetNotifyUrl()
+	// 通知地址优先级：支付方式手动配置 > 请求透传 > 插件全局
+	manualNotify := strings.TrimSpace(req.GetConfig()["notify_url"])
+	notifyURL := manualNotify
+	if notifyURL == "" {
+		notifyURL = req.GetNotifyUrl()
+	}
 	if notifyURL == "" {
 		notifyURL = p.notifyURL
 	}
@@ -282,6 +295,25 @@ func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentReq
 	p.debugf("CreatePayment SDK 响应: resp=%+v err=%v", resp, err)
 	if err != nil {
 		p.debugf("CreatePayment SDK 错误: %v", err)
+		shouldFallbackToSubmit := strings.Contains(err.Error(), "未传入") || strings.Contains(err.Error(), "系统异常")
+		if shouldFallbackToSubmit {
+			p.debugf("CreatePayment 尝试回退 submit.php: pid=%s gateway=%s", pidStr, gatewayURL)
+			formReq := &epay.FormPaymentRequest{
+				Type:       paymentType,
+				OutTradeNo: req.GetExternalId(),
+				NotifyURL:  notifyURL,
+				ReturnURL:  notifyURL,
+				Name:       req.GetSubject(),
+				Money:      float64(req.GetAmountCents()) / 100,
+				Param:      req.GetExternalId(),
+			}
+			if payURL, ferr := client.BuildFormPaymentURL(formReq); ferr == nil && payURL != "" {
+				p.debugf("CreatePayment 回退 submit 成功: payURL=%s", truncateStr(payURL, 200))
+				return &pb.CreatePaymentReply{PayUrl: payURL, GatewayRef: req.GetExternalId()}, nil
+			} else {
+				p.debugf("CreatePayment 回退 submit 失败: %v", ferr)
+			}
+		}
 		// 兼容仅支持 POST 的网关：SDK 走 GET /mapi.php，若网关返回“未传入任何参数”则回退到 POST
 		if strings.Contains(err.Error(), "未传入") {
 			p.debugf("CreatePayment 回退 POST: pid=%s gateway=%s", pidStr, gatewayURL)
