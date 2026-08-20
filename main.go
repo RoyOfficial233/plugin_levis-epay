@@ -39,8 +39,8 @@ import (
 
 const (
 	pluginName    = "易支付"
-	pluginVersion = "1.1.0"
-	pluginDesc    = "对接易支付 V1，仅支持支付宝和微信支付"
+	pluginVersion = "2.0.0"
+	pluginDesc    = "对接易支付 V1，仅支持支付宝和微信支付（支持多支付方式复用）"
 )
 
 func main() {
@@ -120,7 +120,8 @@ func (p *epayPlugin) Describe(context.Context, *pb.DescribeRequest) (*pb.Manifes
 		Capabilities: []pb.Capability{
 			pb.Capability_CAPABILITY_CREATE_PAYMENT,
 		},
-		Config: []*pb.ConfigField{
+		Config: []*pb.ConfigField{},
+		PaymentConfig: []*pb.ConfigField{
 			{
 				Key:      "pid",
 				Label:    "商户 ID",
@@ -141,12 +142,12 @@ func (p *epayPlugin) Describe(context.Context, *pb.DescribeRequest) (*pb.Manifes
 				Label:        "易支付网关地址",
 				Type:         pb.FieldType_FIELD_TYPE_TEXT,
 				Required:     true,
-				DefaultValue: "https://dash.natriumgroup.com",
-				Hint:         "易支付网关地址，默认为官方网关",
+				DefaultValue: "",
+				Hint:         "易支付网关地址，如 https://pay.example.com",
 			},
 			{
 				Key:          "payment_type",
-				Label:        "默认支付方式",
+				Label:        "支付方式",
 				Type:         pb.FieldType_FIELD_TYPE_SELECT,
 				Required:     true,
 				DefaultValue: "alipay",
@@ -170,24 +171,40 @@ func (p *epayPlugin) Configure(_ context.Context, req *pb.ConfigureRequest) (*pb
 	if p.paymentType == "" {
 		p.paymentType = "alipay"
 	}
-	if p.paymentType != "alipay" && p.paymentType != "wxpay" {
+	if p.paymentType != "" && p.paymentType != "alipay" && p.paymentType != "wxpay" {
 		return &pb.ConfigureReply{Error: "支付方式仅支持支付宝或微信支付"}, nil
 	}
 	p.notifyURL = p.apiBase + "/payment-notify/epay"
 
-	if p.gatewayURL == "" {
-		p.gatewayURL = "https://dash.natriumgroup.com"
-	}
-
-	fmt.Fprintf(os.Stderr, "易支付插件已配置: PID=%s, Gateway=%s\n", p.pid, p.gatewayURL)
+	fmt.Fprintf(os.Stderr, "易支付插件已配置（全局配置已废弃，按支付方式配置）: Gateway=%s\n", p.gatewayURL)
 	return &pb.ConfigureReply{}, nil
 }
 
 func (p *epayPlugin) Health(context.Context, *pb.HealthRequest) (*pb.HealthReply, error) {
-	if p.pid == "" || p.key == "" {
-		return &pb.HealthReply{Ok: false, Message: "插件未配置"}, nil
-	}
 	return &pb.HealthReply{Ok: true}, nil
+}
+
+func epayConfig(cfg map[string]string, fallbackPid, fallbackKey, fallbackGateway, fallbackType string) (pid, key, gatewayURL, paymentType string) {
+	pid = cfg["pid"]
+	if pid == "" {
+		pid = fallbackPid
+	}
+	key = cfg["key"]
+	if key == "" {
+		key = fallbackKey
+	}
+	gatewayURL = cfg["gateway_url"]
+	if gatewayURL == "" {
+		gatewayURL = fallbackGateway
+	}
+	paymentType = cfg["payment_type"]
+	if paymentType == "" {
+		paymentType = fallbackType
+	}
+	if paymentType == "" {
+		paymentType = "alipay"
+	}
+	return
 }
 
 func (p *epayPlugin) Shutdown(context.Context, *pb.ShutdownRequest) (*pb.ShutdownReply, error) {
@@ -199,15 +216,25 @@ func (p *epayPlugin) Shutdown(context.Context, *pb.ShutdownRequest) (*pb.Shutdow
 }
 
 func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentRequest) (*pb.CreatePaymentReply, error) {
-	if p.pid == "" || p.key == "" {
-		return nil, status.Error(codes.FailedPrecondition, "插件未配置")
+	pid, key, gatewayURL, paymentType := epayConfig(req.GetConfig(), p.pid, p.key, p.gatewayURL, p.paymentType)
+	if pid == "" || key == "" {
+		return nil, status.Error(codes.FailedPrecondition, "支付方式未配置 PID/KEY")
 	}
-
+	if paymentType != "alipay" && paymentType != "wxpay" {
+		return nil, status.Error(codes.InvalidArgument, "支付方式仅支持支付宝或微信支付")
+	}
+	if gatewayURL == "" {
+		return nil, status.Error(codes.FailedPrecondition, "未配置易支付网关地址")
+	}
+	notifyURL := req.GetNotifyUrl()
+	if notifyURL == "" {
+		notifyURL = p.notifyURL
+	}
 	// 构造易支付 API 请求
 	params := map[string]string{
-		"pid":          p.pid,
+		"pid":          pid,
 		"out_trade_no": req.GetExternalId(),
-		"notify_url":   p.notifyURL,
+		"notify_url":   notifyURL,
 		"name":         req.GetSubject(),
 		"money":        formatMoney(req.GetAmountCents()),
 		"param":        req.GetExternalId(), // 回传订单 ID
@@ -219,19 +246,22 @@ func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentReq
 	}
 	params["clientip"] = clientIP
 
-	// payment_type 已在 Configure 中限制为 alipay/wxpay。
-	params["type"] = p.paymentType
+	params["type"] = paymentType
 	params["device"] = "pc"
-	return p.createAPIPayment(ctx, params, req)
+	return p.createAPIPaymentWithKey(ctx, params, req, key, gatewayURL)
 }
 
-// createAPIPayment 调用 mapi.php 接口创建支付订单
+// createAPIPayment 调用 mapi.php 接口创建支付订单（兼容旧调用方，使用全局配置）
 func (p *epayPlugin) createAPIPayment(ctx context.Context, params map[string]string, req *pb.CreatePaymentRequest) (*pb.CreatePaymentReply, error) {
+	return p.createAPIPaymentWithKey(ctx, params, req, p.key, p.gatewayURL)
+}
+
+func (p *epayPlugin) createAPIPaymentWithKey(ctx context.Context, params map[string]string, req *pb.CreatePaymentRequest, key, gatewayURL string) (*pb.CreatePaymentReply, error) {
 	// 签名
-	params["sign"] = signMD5(params, p.key)
+	params["sign"] = signMD5(params, key)
 
 	// 发起 HTTP POST 请求
-	apiURL := p.gatewayURL + "/mapi.php"
+	apiURL := gatewayURL + "/mapi.php"
 	resp, err := postForm(ctx, apiURL, params)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "调用易支付 API 失败: %v", err)
@@ -263,13 +293,17 @@ func (p *epayPlugin) createSubmitPayment(params map[string]string, req *pb.Creat
 }
 
 func (p *epayPlugin) QueryPayment(ctx context.Context, req *pb.QueryPaymentRequest) (*pb.QueryPaymentReply, error) {
-	if p.pid == "" || p.key == "" {
-		return nil, status.Error(codes.FailedPrecondition, "插件未配置")
+	pid, key, gatewayURL, _ := epayConfig(req.GetConfig(), p.pid, p.key, p.gatewayURL, p.paymentType)
+	if pid == "" || key == "" {
+		return nil, status.Error(codes.FailedPrecondition, "支付方式未配置 PID/KEY")
+	}
+	if gatewayURL == "" {
+		return nil, status.Error(codes.FailedPrecondition, "未配置易支付网关地址")
 	}
 
 	// 调用易支付查询订单接口，out_trade_no 是商户单号
 	apiURL := fmt.Sprintf("%s/api.php?act=order&pid=%s&key=%s&out_trade_no=%s",
-		p.gatewayURL, p.pid, p.key, req.GetExternalId())
+		gatewayURL, pid, key, req.GetExternalId())
 
 	var result struct {
 		Code    int    `json:"code"`
@@ -314,8 +348,12 @@ func (p *epayPlugin) VerifyPaymentCallback(_ context.Context, req *pb.VerifyPaym
 		return nil, status.Error(codes.InvalidArgument, "不支持的签名类型")
 	}
 
-	// 用本地密钥重新计算签名
-	expectedSign := signCallback(raw, p.key)
+	// 用本地密钥重新计算签名（优先按支付方式配置的 KEY）
+	_, key, _, _ := epayConfig(req.GetConfig(), p.pid, p.key, p.gatewayURL, p.paymentType)
+	if key == "" {
+		return nil, status.Error(codes.FailedPrecondition, "支付方式未配置 KEY")
+	}
+	expectedSign := signCallback(raw, key)
 	if receivedSign != expectedSign {
 		return nil, status.Error(codes.Unauthenticated, "签名验证失败")
 	}

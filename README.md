@@ -18,16 +18,17 @@
 | `gateway_url` | 是 | 易支付网关地址 |
 | `payment_type` | 是 | 只能是 `alipay`（支付宝）或 `wxpay`（微信支付） |
 
-示例见 [config.example.yml](config.example.yml)。未填写支付方式时插件默认使用支付宝；其他值会被拒绝并保持未配置状态。
+配置通过 Levis 管理后台的插件配置页面填写，无需本地配置文件。未填写支付方式时插件默认使用支付宝；其他值会被拒绝并保持未配置状态。
 
 ## 编译与安装
 
+在仓库根目录执行：
+
 ```bash
-go mod tidy
-./build.sh
+./build_epay.sh
 ```
 
-构建产物名为 `plugin`。完整插件 ZIP 应包含：
+构建产物为 `epay.zip`。完整插件 ZIP 应包含：
 
 ```text
 epay/

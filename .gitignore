@@ -1,10 +1,16 @@
 # 二进制文件
 plugin
 plugin.exe
+plugin-*
+levis-epay-plugin
 *.exe
 *.dll
 *.so
 *.dylib
+
+# 构建产物
+*.zip
+dist/
 
 # 测试相关
 *.test
