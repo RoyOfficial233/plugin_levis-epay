@@ -11,6 +11,8 @@ levis-epay-plugin
 # 构建产物
 *.zip
 dist/
+epay.zip
+plugin*
 
 # 测试相关
 *.test
