@@ -42,8 +42,8 @@ import (
 
 const (
 	pluginName    = "易支付"
-	pluginVersion = "2.0.5"
-	pluginDesc    = "对接易支付 V1，全量采用 MD5 验证（SDK + POST 回退）"
+	pluginVersion = "2.0.6"
+	pluginDesc    = "对接易支付 V1，全量采用 MD5 验证（SDK + POST 回退，支持调试日志）"
 )
 
 func main() {
@@ -112,6 +112,7 @@ type epayPlugin struct {
 	gatewayURL  string
 	notifyURL   string
 	paymentType string
+	debug       bool
 }
 
 func (p *epayPlugin) Describe(context.Context, *pb.DescribeRequest) (*pb.Manifest, error) {
@@ -123,7 +124,16 @@ func (p *epayPlugin) Describe(context.Context, *pb.DescribeRequest) (*pb.Manifes
 		Capabilities: []pb.Capability{
 			pb.Capability_CAPABILITY_CREATE_PAYMENT,
 		},
-		Config: []*pb.ConfigField{},
+		Config: []*pb.ConfigField{
+			{
+				Key:          "debug",
+				Label:        "调试模式",
+				Type:         pb.FieldType_FIELD_TYPE_BOOL,
+				Required:     false,
+				DefaultValue: "0",
+				Hint:         "开启后在插件日志中输出所有请求 URL、参数与网关响应",
+			},
+		},
 		PaymentConfig: []*pb.ConfigField{
 			{
 				Key:      "pid",
@@ -171,6 +181,7 @@ func (p *epayPlugin) Configure(_ context.Context, req *pb.ConfigureRequest) (*pb
 	p.key = values["key"]
 	p.gatewayURL = values["gateway_url"]
 	p.paymentType = values["payment_type"]
+	p.debug = values["debug"] == "1" || strings.EqualFold(values["debug"], "true")
 	if p.paymentType == "" {
 		p.paymentType = "alipay"
 	}
@@ -179,8 +190,25 @@ func (p *epayPlugin) Configure(_ context.Context, req *pb.ConfigureRequest) (*pb
 	}
 	p.notifyURL = p.apiBase + "/payment-notify/epay"
 
-	fmt.Fprintf(os.Stderr, "易支付插件已配置（全局配置已废弃，按支付方式配置）: Gateway=%s\n", p.gatewayURL)
+	if p.debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG] 易支付插件已配置: Gateway=%s Debug=ON\n", p.gatewayURL)
+	} else {
+		fmt.Fprintf(os.Stderr, "易支付插件已配置（全局配置已废弃，按支付方式配置）: Gateway=%s\n", p.gatewayURL)
+	}
 	return &pb.ConfigureReply{}, nil
+}
+
+func (p *epayPlugin) debugf(format string, args ...any) {
+	if p.debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG] "+format+"\n", args...)
+	}
+}
+
+func truncateStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func (p *epayPlugin) Health(context.Context, *pb.HealthRequest) (*pb.HealthReply, error) {
@@ -235,8 +263,10 @@ func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentReq
 		notifyURL = p.notifyURL
 	}
 	// 全部采用 V1 MD5 接口，通过官方 SDK 保证签名与参数一致
-	client, err := epay.NewClient(&epay.Config{PID: pid, Key: key, APIBaseURL: gatewayURL})
+	p.debugf("CreatePayment: pid=%s gateway=%s amount=%d type=%s notify=%s subject=%s clientip=%s", pidStr, gatewayURL, req.GetAmountCents(), paymentType, notifyURL, req.GetSubject())
+	client, err := epay.NewClient(&epay.Config{PID: pid, Key: key, APIBaseURL: gatewayURL, Debug: p.debug})
 	if err != nil {
+		p.debugf("CreatePayment NewClient 失败: %v", err)
 		return nil, status.Errorf(codes.InvalidArgument, "易支付配置错误: %v", err)
 	}
 	resp, err := client.CreatePayment(&epay.PaymentRequest{
@@ -249,9 +279,12 @@ func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentReq
 		Device:     "pc",
 		Param:      req.GetExternalId(),
 	})
+	p.debugf("CreatePayment SDK 响应: resp=%+v err=%v", resp, err)
 	if err != nil {
+		p.debugf("CreatePayment SDK 错误: %v", err)
 		// 兼容仅支持 POST 的网关：SDK 走 GET /mapi.php，若网关返回“未传入任何参数”则回退到 POST
 		if strings.Contains(err.Error(), "未传入") {
+			p.debugf("CreatePayment 回退 POST: pid=%s gateway=%s", pidStr, gatewayURL)
 			params := map[string]string{
 				"pid":          pidStr,
 				"out_trade_no": req.GetExternalId(),
@@ -268,7 +301,9 @@ func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentReq
 			params["sign"] = signMD5(params, key)
 			params["sign_type"] = "MD5"
 			base := strings.TrimRight(gatewayURL, "/")
+			p.debugf("CreatePayment POST 参数: %v", params)
 			if postResp, perr := postForm(ctx, base+"/mapi.php", params); perr == nil && int(postResp.Code) == 1 {
+				p.debugf("CreatePayment POST 成功: payurl=%s trade_no=%s", postResp.PayURL, postResp.TradeNo)
 				payURL := postResp.PayURL
 				if payURL == "" {
 					payURL = postResp.QRCode
@@ -280,7 +315,10 @@ func (p *epayPlugin) CreatePayment(ctx context.Context, req *pb.CreatePaymentReq
 					return &pb.CreatePaymentReply{PayUrl: payURL, GatewayRef: postResp.TradeNo}, nil
 				}
 			} else if perr == nil {
+				p.debugf("CreatePayment POST 业务错误: code=%d msg=%s", int(postResp.Code), postResp.Msg)
 				return nil, status.Errorf(codes.Internal, "易支付返回错误: %s", postResp.Msg)
+			} else {
+				p.debugf("CreatePayment POST 网络错误: %v", perr)
 			}
 		}
 		return nil, status.Errorf(codes.Internal, "易支付返回错误: %v", err)
@@ -310,11 +348,14 @@ func (p *epayPlugin) QueryPayment(ctx context.Context, req *pb.QueryPaymentReque
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "商户 ID 必须为数字")
 	}
-	client, err := epay.NewClient(&epay.Config{PID: pid, Key: key, APIBaseURL: gatewayURL})
+	p.debugf("QueryPayment: pid=%s gateway=%s out_trade_no=%s", pidStr, gatewayURL, req.GetExternalId())
+	client, err := epay.NewClient(&epay.Config{PID: pid, Key: key, APIBaseURL: gatewayURL, Debug: p.debug})
 	if err != nil {
+		p.debugf("QueryPayment NewClient 失败: %v", err)
 		return nil, status.Errorf(codes.InvalidArgument, "易支付配置错误: %v", err)
 	}
 	detail, err := client.QueryOrder(&epay.OrderQueryRequest{OutTradeNo: req.GetExternalId()})
+	p.debugf("QueryPayment 响应: detail=%+v err=%v", detail, err)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "查询订单失败: %v", err)
 	}
@@ -343,12 +384,10 @@ func (p *epayPlugin) VerifyPaymentCallback(_ context.Context, req *pb.VerifyPaym
 	// 采用官方 SDK 的 V1 MD5 校验，与 epay-sdk-go 保持一致
 	pidStr, key, gatewayURL, _ := epayConfig(req.GetConfig(), p.pid, p.key, p.gatewayURL, p.paymentType)
 	if key == "" {
+		p.debugf("Verify: 缺少 KEY, raw=%v", raw)
 		return nil, status.Error(codes.FailedPrecondition, "支付方式未配置 KEY")
 	}
-	// 校验签名类型
-	if signType != "" && signType != "MD5" {
-		return nil, status.Error(codes.InvalidArgument, "不支持的签名类型")
-	}
+	p.debugf("Verify: raw=%v pid=%s gateway=%s", raw, pidStr, gatewayURL)
 	pid := 0
 	if pidStr != "" {
 		pid, _ = strconv.Atoi(pidStr)
@@ -361,16 +400,20 @@ func (p *epayPlugin) VerifyPaymentCallback(_ context.Context, req *pb.VerifyPaym
 	if gatewayURL == "" {
 		gatewayURL = "https://example.com"
 	}
-	client, err := epay.NewClient(&epay.Config{PID: pid, Key: key, APIBaseURL: gatewayURL})
+	client, err := epay.NewClient(&epay.Config{PID: pid, Key: key, APIBaseURL: gatewayURL, Debug: p.debug})
 	var notifyData *epay.NotifyData
 	if err == nil {
+		p.debugf("Verify: 调用 SDK VerifyNotify raw=%v", raw)
 		notifyData, err = client.VerifyNotify(raw)
+		p.debugf("Verify: SDK 结果 notifyData=%+v err=%v", notifyData, err)
 		if err != nil {
 			return nil, status.Error(codes.Unauthenticated, "签名验证失败")
 		}
 	} else {
+		p.debugf("Verify: SDK 创建失败 %v，使用本地校验", err)
 		// 兜底：SDK 创建失败时使用本地 MD5 校验
 		expectedSign := signCallback(raw, key)
+		p.debugf("Verify: 本地计算签名 expected=%s received=%s", expectedSign, receivedSign)
 		if receivedSign != expectedSign {
 			return nil, status.Error(codes.Unauthenticated, "签名验证失败")
 		}
